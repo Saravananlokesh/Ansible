@@ -1,0 +1,126 @@
+goldengate_patch.yml
+---
+- name: Oracle GoldenGate Patching
+  hosts: "{{ hostlist }}"
+  become: true
+  vars:
+    oracle_home: /opt/app/ogg21c
+    patch_dir: /acfs01/GG_software/patching
+    patch_zip: p37071355_2116000OGGRU_Linux-x86-64.zip
+    opatch_zip: p6880880_190000_Linux-x86-64.zip
+    patch_user: ggudb
+    patch_group: oinstall
+
+  tasks:
+
+    - name: Set environment variables
+      ansible.builtin.set_fact:
+        env_vars:
+          ORACLE_HOME: "{{ oracle_home }}"
+          PATH: "{{ ansible_env.PATH }}:{{ oracle_home }}/OPatch:{{ oracle_home }}/bin"
+
+    - name: Stop GoldenGate processes
+      ansible.builtin.shell: |
+        {{ oracle_home }}/ggsci <<EOF
+        stop EXT*
+        stop PMP*
+        stop REP*
+        stop mgr
+        exit
+        EOF
+      become_user: "{{ patch_user }}"
+      environment: "{{ env_vars }}"
+      ignore_errors: true  # In case some processes are already stopped
+
+    - name: Create patch directory
+      ansible.builtin.file:
+        path: "{{ patch_dir }}"
+        state: directory
+        owner: "{{ patch_user }}"
+        group: "{{ patch_group }}"
+        mode: '0755'
+
+    - name: Verify patch file exists
+      ansible.builtin.stat:
+        path: "{{ patch_dir }}/{{ patch_zip }}"
+      register: patch_file_stat
+
+    - name: Copy patch zip file to target server
+      ansible.builtin.copy:
+        src: "/tmp/{{ patch_zip }}"
+        dest: "{{ patch_dir }}/{{ patch_zip }}"
+      when: not patch_file_stat.stat.exists
+
+    - name: Re-verify patch file exists after copy
+      ansible.builtin.stat:
+        path: "{{ patch_dir }}/{{ patch_zip }}"
+      register: patch_file_stat_after_copy
+
+    - name: Fail if patch file is missing
+      ansible.builtin.fail:
+        msg: "Patch file {{ patch_dir }}/{{ patch_zip }} does not exist. Please ensure the file is present before running the playbook."
+      when: not patch_file_stat_after_copy.stat.exists
+
+    - name: Unzip patch file
+      ansible.builtin.unarchive:
+        src: "{{ patch_dir }}/{{ patch_zip }}"
+        dest: "{{ patch_dir }}"
+        remote_src: yes
+      become_user: "{{ patch_user }}"
+
+    - name: Backup existing OPatch directory
+      ansible.builtin.command: mv OPatch OPatch_bkp
+      args:
+        chdir: "{{ oracle_home }}"
+      become_user: "{{ patch_user }}"
+      ignore_errors: true  # If already backed up
+
+    - name: Copy OPatch zip file
+      ansible.builtin.copy:
+        src: "{{ patch_dir }}/{{ opatch_zip }}"
+        dest: "{{ oracle_home }}/{{ opatch_zip }}"
+        remote_src: yes
+      become_user: "{{ patch_user }}"
+
+    - name: Unzip OPatch utility
+      ansible.builtin.unarchive:
+        src: "{{ oracle_home }}/{{ opatch_zip }}"
+        dest: "{{ oracle_home }}"
+        remote_src: yes
+      become_user: "{{ patch_user }}"
+
+    - name: Run conflict check
+      ansible.builtin.command: opatch prereq CheckConflictAgainstOHWithDetail -ph ./
+      args:
+        chdir: "{{ patch_dir }}/37071355"
+      become_user: "{{ patch_user }}"
+      environment: "{{ env_vars }}"
+
+    - name: Apply patch
+      ansible.builtin.command: opatch apply -silent
+      args:
+        chdir: "{{ patch_dir }}/37071355"
+      become_user: "{{ patch_user }}"
+      environment: "{{ env_vars }}"
+
+    - name: Validate patch installation
+      ansible.builtin.command: opatch lsinventory
+      become_user: "{{ patch_user }}"
+      environment: "{{ env_vars }}"
+      register: lsinventory_output
+
+    - name: Print lsinventory output
+      ansible.builtin.debug:
+        msg: "{{ lsinventory_output.stdout_lines }}"
+
+    - name: Start GoldenGate processes
+      ansible.builtin.shell: |
+        {{ oracle_home }}/ggsci <<EOF
+        start mgr
+        start EXT*
+        start PMP*
+        start REP*
+        exit
+        EOF
+      become_user: "{{ patch_user }}"
+      environment: "{{ env_vars }}"
