@@ -96,14 +96,8 @@ Feel free to fork the repository, improve the logic, and submit pull requests. S
 
 ---
 
-## 📜 License
-
-This project is licensed under the [MIT License](LICENSE).
-
----
-
 ## 👨‍💻 Maintainer
 
-**Your Name**  
-📧 your.email@example.com  
-🌐 [your-website-or-blog](https://example.com)
+**Saravanan Mahalingam**  
+📧 saravananlokesh2@gmail.com
+🌐 https://dbanavigator.blogspot.com/ 
