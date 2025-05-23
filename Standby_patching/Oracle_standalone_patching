@@ -1,0 +1,310 @@
+vi oracle_patch.yml
+---
+- name: Oracle OPatch and Patch Automation
+  hosts: oracle_servers
+  become: yes
+  vars:
+    oracle_homes:
+      - /u01/app/oracle/product/19c/db_1  # List of Oracle Home directories
+    patch_zip: /tmp/p37642901_190000_Linux-x86-64.zip  # Path to the patch zip file
+    opatch_zip: /tmp/p6880880_190000_Linux-x86-64.zip  # Path to the OPatch zip file
+    patch_base_dir: /u01/Patch  # Base directory for patch extraction
+    oracle_user: oracle  # Oracle user for operations
+    oracle_sid: ORCL  # Default Oracle SID
+
+  tasks:
+    # Ensure the oracle user exists
+    - name: Ensure oracle user exists
+      user:
+        name: "{{ oracle_user }}"
+        state: present
+        shell: /bin/bash
+        home: /home/{{ oracle_user }}
+        create_home: yes
+
+    # Copy OPatch zip file to the target system
+    - name: Copy OPatch zip file to target system
+      copy:
+        src: "{{ opatch_zip }}"
+        dest: "{{ opatch_zip }}"
+        owner: "{{ oracle_user }}"
+        mode: '0644'
+
+    # Verify the OPatch zip file location on the target system
+    - name: Debug OPatch zip file location
+      command: ls -l "{{ opatch_zip }}"
+      register: opatch_zip_debug
+      ignore_errors: true
+
+    # Print debug output for OPatch zip file
+    - name: Print OPatch zip file debug output
+      debug:
+        var: opatch_zip_debug.stdout
+
+    # Copy the patch zip file to the target system
+    - name: Copy patch zip file to target system
+      copy:
+        src: "{{ patch_zip }}"
+        dest: "{{ patch_zip }}"
+        owner: "{{ oracle_user }}"
+        mode: '0644'
+
+    # Verify if the OPatch zip file exists on the target system
+    - name: Verify OPatch zip file exists
+      stat:
+        path: "{{ opatch_zip }}"
+      register: opatch_zip_stat
+
+    # Fail the playbook if the OPatch zip file is missing
+    - name: Fail if OPatch zip file is missing
+      fail:
+        msg: "OPatch zip file {{ opatch_zip }} does not exist on the target system."
+      when: not opatch_zip_stat.stat.exists
+
+    # Ensure the patch base directory exists
+    - name: Ensure Patch base directory exists
+      file:
+        path: "{{ patch_base_dir }}"
+        state: directory
+        owner: "{{ oracle_user }}"
+        mode: '0755'
+
+    # Ensure Oracle Home directories exist
+    - name: Ensure Oracle Home directories exist
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ oracle_user }}"
+        mode: '0755'
+      with_items: "{{ oracle_homes }}"
+
+    # Backup the existing OPatch directory in Oracle Home
+    - name: Check if OPatch directory exists
+      stat:
+        path: "{{ item }}/OPatch"
+      register: opatch_stat
+      with_items: "{{ oracle_homes }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Backup existing OPatch directory
+      command: mv OPatch OPATCH_{{ ansible_date_time.date }}
+      args:
+        chdir: "{{ item }}"
+      become_user: "{{ oracle_user }}"
+      when: opatch_stat.results | selectattr('item', 'equalto', item) | map(attribute='stat.exists') | first | default(false)
+      with_items: "{{ oracle_homes }}"
+      loop_control:
+        label: "{{ item }}"
+
+    # Copy the OPatch zip file to each Oracle Home
+    - name: Copy OPatch zip to Oracle Home
+      copy:
+        src: "{{ opatch_zip }}"
+        dest: "{{ item }}/p6880880_190000_Linux-x86-64.zip"
+        owner: "{{ oracle_user }}"
+      with_items: "{{ oracle_homes }}"
+
+    # Unzip the new OPatch directory in Oracle Home
+    - name: Unzip new OPatch
+      unarchive:
+        src: "{{ item }}/p6880880_190000_Linux-x86-64.zip"
+        dest: "{{ item }}"
+        remote_src: yes
+        owner: "{{ oracle_user }}"
+      with_items: "{{ oracle_homes }}"
+
+    # Unzip the patch file into the patch base directory
+    - name: Unzip patch file
+      unarchive:
+        src: "{{ patch_zip }}"
+        dest: "{{ patch_base_dir }}"
+        remote_src: yes
+        owner: "{{ oracle_user }}"
+      register: patch_unzip_result
+
+    # Find the extracted patch directory
+    - name: Get extracted patch directory
+      find:
+        paths: "{{ patch_base_dir }}"
+        file_type: directory
+        depth: 1
+      register: extracted_patch_dir
+
+    # Fail the playbook if no extracted patch directory is found
+    - name: Fail if no extracted patch directory is found
+      fail:
+        msg: "No extracted patch directory found under {{ patch_base_dir }}."
+      when: extracted_patch_dir.files | length == 0
+
+    # Check for conflicts against Oracle Home using OPatch
+    - name: Run CheckConflictAgainstOHWithDetail
+      command: "{{ item }}/OPatch/opatch prereq CheckConflictAgainstOHWithDetail -ph ."
+      args:
+        chdir: "{{ extracted_patch_dir.files[0].path }}"
+      become_user: "{{ oracle_user }}"
+      register: prereq_check
+      ignore_errors: true
+      with_items: "{{ oracle_homes }}"
+      loop_control:
+        label: "{{ item }}"
+
+    # Fail the playbook if OPatch prerequisite check fails
+    - name: Fail if OPatch prereq check fails
+      fail:
+        msg: >-
+          Conflict detected or invalid Oracle Home for {{ item }}.
+          Error: {{
+            (prereq_check.results | selectattr('item', 'equalto', item) | list | first | default({})).stdout
+          }}
+      when: prereq_check is defined and
+            (prereq_check.results | selectattr('item', 'equalto', item) | list | first | default({})).rc != 0
+      with_items: "{{ oracle_homes }}"
+      loop_control:
+        label: "{{ item }}"
+
+    # Extract the SID from running database processes
+    - name: Extract SID from running database processes
+      shell: |
+        ps -ef | grep pmon | grep -v grep | awk -F_ '{print $NF}'
+      register: db_sid
+      ignore_errors: true
+
+    # Dynamically set the ORACLE_SID environment variable
+    - name: Set ORACLE_SID environment dynamically
+      set_fact:
+        oracle_env:
+          ORACLE_HOME: "{{ item }}"
+          ORACLE_SID: "{{ db_sid.stdout.strip() }}"
+          PATH: "{{ item }}/bin:{{ item }}/OPatch:{{ ansible_env.PATH }}"
+      with_items: "{{ oracle_homes }}"
+      when: db_sid.stdout.strip() != ""
+      loop_control:
+        label: "{{ item }}"
+
+    # Check if the database is running
+    - name: Check if database is running
+      shell: |
+        ps -ef | grep pmon | grep "{{ oracle_sid }}" | grep -v grep
+      register: db_status
+      ignore_errors: true
+      with_items: "{{ oracle_homes }}"
+      loop_control:
+        label: "{{ item }}"
+
+    # Shutdown the database
+    - name: Shutdown database
+      shell: |
+        echo "shutdown immediate;" | sqlplus -s / as sysdba
+      environment: "{{ oracle_env }}"
+      become_user: "{{ oracle_user }}"
+      with_items: "{{ oracle_homes }}"
+      when: db_sid.stdout.strip() != ""  # Only attempt shutdown if SID is found
+      retries: 3  # Retry up to 3 times
+      delay: 10  # Wait 10 seconds between retries
+      register: shutdown_result
+      ignore_errors: true  # Ignore errors if the database is already shutting down
+
+    # Stop the Oracle Listener
+    - name: Stop Listener
+      shell: lsnrctl stop
+      environment: "{{ oracle_env }}"
+      become_user: "{{ oracle_user }}"
+      with_items: "{{ oracle_homes }}"
+      ignore_errors: true  # Ignore errors if the listener is not running
+
+    # Create a patch directory with a timestamp
+    - name: Create patch directory with timestamp
+      file:
+        path: "{{ patch_base_dir }}/patch_{{ ansible_date_time.iso8601_basic_short }}"
+        state: directory
+        owner: "{{ oracle_user }}"
+      register: patch_dir
+      with_items: "{{ oracle_homes }}"
+
+    # Unzip the current patch into the patch directory
+    - name: Unzip current patch
+      unarchive:
+        src: "{{ patch_zip }}"
+        dest: "{{ item.path }}"
+        remote_src: yes
+        owner: "{{ oracle_user }}"
+      with_items: "{{ patch_dir.results }}"
+      when: item.path is defined
+
+    # Find the extracted patch directory
+    - name: Get extracted patch directory
+      find:
+        paths: "{{ item.path }}"
+        file_type: directory
+        depth: 1
+      register: extracted_patch_dir
+      with_items: "{{ patch_dir.results }}"
+      when: item.path is defined
+
+    # Run lsinventory to list installed patches
+    - name: Run lsinventory
+      command: "{{ item }}/OPatch/opatch lsinventory"
+      environment: "{{ oracle_env }}"
+      become_user: "{{ oracle_user }}"
+      with_items: "{{ oracle_homes }}"
+
+    # Kill any remaining Oracle processes
+    - name: Kill remaining Oracle processes
+      shell: |
+        ps -ef | grep "{{ item }}" | grep -v grep | awk '{print $2}' | xargs -r kill -9
+      with_items: "{{ oracle_homes }}"
+      ignore_errors: true  # Ignore errors if no processes are found
+
+    # Check for active processes using ORACLE_HOME
+    - name: Check for active processes using ORACLE_HOME
+      shell: |
+        fuser -v {{ item }}/bin/oracle {{ item }}/lib/libclntsh.so.19.1 {{ item }}/lib/libsqlplus.so 2>/dev/null || true
+      register: active_processes
+      with_items: "{{ oracle_homes }}"
+      ignore_errors: true
+
+    # Retry applying the patch silently
+    - name: Retry Apply patch silently
+      command: "{{ item.0 }}/OPatch/opatch apply -silent"
+      args:
+        chdir: "{{ item.1.files[0].path }}"
+      environment: "{{ oracle_env }}"
+      become_user: "{{ oracle_user }}"
+      with_together:
+        - "{{ oracle_homes }}"
+        - "{{ extracted_patch_dir.results }}"
+      when: item.1.files | length > 0
+      retries: 3  # Retry up to 3 times
+      delay: 10  # Wait 10 seconds between retries
+
+    # Start the database
+    - name: Start database
+      shell: |
+        echo "startup;" | sqlplus -s / as sysdba
+      environment: "{{ oracle_env }}"
+      become_user: "{{ oracle_user }}"
+      with_items: "{{ oracle_homes }}"
+
+    # Start the Oracle Listener
+    - name: Start Listener
+      shell: lsnrctl start
+      environment: "{{ oracle_env }}"
+      become_user: "{{ oracle_user }}"
+      with_items: "{{ oracle_homes }}"
+
+    # Run datapatch to apply SQL changes
+    - name: Run datapatch
+      command: "./datapatch -verbose"
+      args:
+        chdir: "{{ item }}/OPatch"
+      environment: "{{ oracle_env }}"
+      become_user: "{{ oracle_user }}"
+      with_items: "{{ oracle_homes }}"
+
+    # Check the applied patches
+    - name: Check lspatches
+      command: "{{ item }}/OPatch/opatch lspatches"
+      environment: "{{ oracle_env }}"
+      become_user: "{{ oracle_user }}"
+      with_items: "{{ oracle_homes }}"
